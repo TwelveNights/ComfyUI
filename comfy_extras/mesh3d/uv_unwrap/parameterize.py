@@ -175,6 +175,23 @@ def _segment_argmax(vals: np.ndarray, seg: np.ndarray, n: int) -> np.ndarray:
     return np.where(out == np.iinfo(np.int64).max, -1, out)
 
 
+def _solve_batched_gpu(AtA: Tensor, Atb: Tensor) -> Tensor:
+    """torch.linalg.solve over a batch, halving the batch while hipBLAS runs out of its fixed
+    batched-LU workspace (HIPBLAS_STATUS_ALLOC_FAILED: PyTorch gives the handle 32 MiB on most AMD
+    GPUs, which large getrfBatched calls exceed regardless of free VRAM). A single system that
+    still fails is solved on the CPU."""
+    try:
+        return torch.linalg.solve(AtA, Atb)
+    except RuntimeError as e:
+        if "HIPBLAS_STATUS_ALLOC_FAILED" not in str(e):
+            raise
+    if AtA.shape[0] == 1:
+        x = np.linalg.solve(AtA.cpu().numpy(), Atb.cpu().numpy()[..., None])[..., 0]
+        return torch.from_numpy(x).to(Atb.device)
+    h = AtA.shape[0] // 2
+    return torch.cat([_solve_batched_gpu(AtA[:h], Atb[:h]), _solve_batched_gpu(AtA[h:], Atb[h:])])
+
+
 def lscm_charts_batch(
     verts: np.ndarray,            # (sumV, 3) float64, per-chart concatenated
     uv_pins: np.ndarray,          # (sumV, 2) float64, ortho UVs (pin values + fallback)
@@ -335,7 +352,7 @@ def lscm_charts_batch(
             dsc = 1e-12 * torch.nan_to_num(dpos.nanmedian(dim=1).values, nan=1e-8).clamp_min(1e-20)
             diag += torch.where(con_t, torch.ones_like(diag), dsc[:, None].expand_as(diag))
             Atb = torch.where(con_t, torch.from_numpy(cval).to(device), Atb)
-            x = torch.linalg.solve(AtA, Atb).cpu().numpy()
+            x = _solve_batched_gpu(AtA, Atb).cpu().numpy()
         else:
             At = A.transpose(0, 2, 1)
             AtA = At @ A                             # batched BLAS dgemm
